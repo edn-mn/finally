@@ -153,7 +153,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Updates at ~500ms intervals
 - Correlated moves across tickers (e.g., tech stocks move together)
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
-- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
+- Starts from realistic seed prices for the 10 default tickers (e.g., AAPL ~$190, GOOGL ~$175, etc.); a ticker added later with no predefined seed gets a randomized starting price in a plausible range instead of a symbol-specific realistic price
 - Runs as an in-process background task — no external dependencies
 
 ### Massive API (Optional)
@@ -175,8 +175,8 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — this is the union of the user's watchlist and any ticker with an open position, so a held position keeps a live price after being removed from the watchlist
+- Each SSE event's `data` is a single JSON object keyed by ticker, batching every tracked ticker's update into one event per tick (e.g. `{"AAPL": {"price": ..., "previous_price": ..., "timestamp": ..., ...}, "GOOGL": {...}}`) — not one event per ticker
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -215,6 +215,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
+- Selling a position down to zero quantity deletes its row (no zero-quantity rows are kept); a later buy of the same ticker does a fresh INSERT
 
 **trades** — Trade history (append-only log)
 - `id` TEXT PRIMARY KEY (UUID)
@@ -225,7 +226,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded immediately after each trade execution, and by a background task every 30 seconds; the periodic task skips its snapshot if one was already recorded within the last 5 seconds, avoiding duplicate points.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -260,12 +261,16 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
 | GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
 
+Trade execution reads its fill price from the shared price cache (Section 6) at the moment of execution. If the ticker has no cached price (never added to the watchlist and no open position in it), the trade is rejected with a 400 error before cash/share validation runs. Reading the current cash balance/position quantity, validating, and writing the updated rows happens inside a single SQLite transaction (`BEGIN IMMEDIATE`), so a manual trade and an LLM auto-executed trade landing at the same time can't both validate against the same stale cash balance.
+
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
 | POST | `/api/watchlist` | Add a ticker: `{ticker}` |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+
+Removing a ticker from the watchlist does not affect an open position in it — per Section 6, the price feed keeps tracking any ticker with a nonzero position until it's fully sold.
 
 ### Chat
 | Method | Path | Description |
@@ -294,9 +299,10 @@ When the user sends a chat message, the backend:
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
-6. Auto-executes any trades or watchlist changes specified in the response
-7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+6. Auto-executes any trades or watchlist changes specified in the response, recording per-item success/failure
+7. If any trade or watchlist change failed validation, appends a short backend-generated note to `message` — the LLM wrote `message` before execution, so it cannot already reflect a failure
+8. Stores the message (with any appended notes) and executed actions in `chat_messages`
+9. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
 
 ### Structured Output Schema
 
@@ -309,14 +315,15 @@ The LLM is instructed to respond with JSON matching this schema:
     {"ticker": "AAPL", "side": "buy", "quantity": 10}
   ],
   "watchlist_changes": [
-    {"ticker": "PYPL", "action": "add"}
+    {"ticker": "PYPL", "action": "add"},
+    {"ticker": "NFLX", "action": "remove"}
   ]
 }
 ```
 
 - `message` (required): The conversational text shown to the user
-- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
-- `watchlist_changes` (optional): Array of watchlist modifications
+- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells, and a cached price available for the ticker — see Section 8)
+- `watchlist_changes` (optional): Array of watchlist modifications. `action` is `"add"` or `"remove"` — no other values are valid
 
 ### Auto-Execution
 
@@ -325,7 +332,7 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+If a trade fails validation (e.g., insufficient cash), the backend appends a short note to `message` before storing/returning it (e.g., "Note: the AAPL buy could not be completed — insufficient cash.") — see step 7 above. This avoids a second LLM call just to regenerate the response text.
 
 ### System Prompt Guidance
 
@@ -393,13 +400,13 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 
 ### Docker Volume
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a bind mount of the repo's `db/` directory:
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v $(pwd)/db:/app/db -p 8000:8000 --env-file .env finally
 ```
 
-The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path, so the file is visible directly in the repo's `db/` folder on the host.
 
 ### Start/Stop Scripts
 
@@ -411,7 +418,7 @@ The `db/` directory in the project root maps to `/app/db` in the container. The 
 
 **`scripts/stop_mac.sh`** (macOS/Linux):
 - Stops and removes the running container
-- Does NOT remove the volume (data persists)
+- Does NOT delete the `db/` directory (data persists)
 
 **`scripts/start_windows.ps1`** / **`scripts/stop_windows.ps1`**: PowerShell equivalents for Windows.
 
@@ -429,7 +436,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 **Backend (pytest)**:
 - Market data: simulator generates valid prices, GBM math is correct, Massive API response parsing works, both implementations conform to the abstract interface
-- Portfolio: trade execution logic, P&L calculations, edge cases (selling more than owned, buying with insufficient cash, selling at a loss)
+- Portfolio: trade execution logic, P&L calculations, edge cases (selling more than owned, buying with insufficient cash, selling at a loss, trading a ticker with no cached price, concurrent trades racing on the same cash balance)
 - LLM: structured output parsing handles all valid schemas, graceful handling of malformed responses, trade validation within chat flow
 - API routes: correct status codes, response shapes, error handling
 
@@ -450,7 +457,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Fresh start: default watchlist appears, $10k balance shown, prices are streaming
 - Add and remove a ticker from the watchlist
 - Buy shares: cash decreases, position appears, portfolio updates
-- Sell shares: cash increases, position updates or disappears
+- Sell shares: cash increases, position quantity/avg cost updates on a partial sell, and the position row is deleted when a full sell brings quantity to zero
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
