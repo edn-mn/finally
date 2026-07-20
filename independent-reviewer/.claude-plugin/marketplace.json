@@ -1,0 +1,14 @@
+{
+  "name": "independent-reviewer-marketplace",
+  "owner": {
+    "name": "FinAlly Project"
+  },
+  "plugins": [
+    {
+      "name": "independent-reviewer",
+      "source": "./",
+      "description": "A plugin that provides independent review and feedback of all changes since last commit.",
+      "version": "1.0.0"
+    }
+  ]
+}
