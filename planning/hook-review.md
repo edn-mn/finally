@@ -1,37 +1,39 @@
-# Change Review
+# Review of changes since last commit
 
 ## Findings
 
-### [P1] Add a valid plugin manifest
+### [P1] Remove the claim that the timestamp issue does not affect the implementation
 
-File: `independent-reviewer/.claude-plugin/plugin.json:1`
+`planning/MASSIVE.md:205-208` says none of the listed corrections affect
+`backend/app/market/massive_client.py`, but correction 3 is exactly the production bug
+described elsewhere in these changes: the implementation reads the nonexistent
+`last_trade.timestamp` field and uses the wrong unit conversion. As written, the
+conclusion contradicts both `planning/MASSIVE.md:200-203` and the detailed diagnosis in
+`planning/MARKET_INTERFACE.md:118-156`, and could cause a maintainer to leave the broken
+real-data path unfixed. State that the first two corrections did not affect the
+implementation, while the timestamp correction does.
 
-The manifest is empty, so it is not valid JSON and does not identify the plugin. Claude Code cannot discover or load `independent-reviewer` as a plugin in this state. Populate the file with a valid manifest containing at least a plugin `name` (and the intended metadata).
+### [P2] Do not describe previous-close change as change since market open
 
-### [P1] Make the plugin hooks file valid JSON
+`planning/MARKET_INTERFACE.md:80-90` correctly identifies `snap.prev_day.close` and
+`snap.todays_change_percent`, but then calls these values "change since market open" and
+"intraday-open-to-now change." They represent change from the previous session's close,
+not from today's open. Those can differ materially after an overnight gap. Use "change
+since previous close" consistently so a future implementation does not expose the field
+under the wrong semantics.
 
-File: `independent-reviewer/hooks/hooks.json:1`
+### [P2] Reconcile the no-dual-class criterion with GOOGL
 
-The file begins with `"hooks":` but has no enclosing top-level braces. JSON parsing therefore fails before Claude Code can register the Stop hook. Wrap the current content in `{ ... }` and validate the completed file as JSON.
+`planning/WATCHLIST_TICKERS.md:11-14` makes absence of dual-class ticker confusion a
+selection criterion, while `planning/WATCHLIST_TICKERS.md:35` retains GOOGL and lines
+45-50 claim every criterion is satisfied. Alphabet has both GOOGL (Class A) and GOOG
+(Class C), so the selected list does not satisfy the stated criterion. Either narrow the
+criterion to accepting an explicitly chosen share class, explain why GOOGL is preferred,
+or choose a ticker without this ambiguity.
 
-### [P1] Use supported model values in the custom agents
+## Scope and verification
 
-Files: `.claude/agents/change-reviewer.md:4`, `.claude/agents/reviewer.md:4`, `.claude/agents/security-check.md:4`
-
-The agents specify `GPT-4.1` and `Sonnet 5`. Claude Code agent frontmatter expects a supported Claude alias such as `sonnet`, `opus`, `haiku`, or `inherit`, or a valid full Claude model ID. These values can prevent agent creation. Replace them with supported identifiers or omit `model` to inherit the caller's model.
-
-### [P1] Correct the `change-reviewer` tool allowlist
-
-File: `.claude/agents/change-reviewer.md:5`
-
-The `tools` field is an allowlist, but it contains generic lowercase names (`execute`, `read`, `search`, `web`, `agent`, and `todo`) rather than Claude Code's exact tool identifiers. The agent may consequently lack the inspection and write tools required to produce `change-review.md`. Use valid names such as `Read`, `Grep`, `Glob`, `Bash`, `Write`, and `Edit`, limited to what the reviewer actually needs.
-
-### [P2] Give `security-check` review instructions
-
-File: `.claude/agents/security-check.md:6`
-
-The file ends immediately after its frontmatter. The `description` is delegation metadata, while the Markdown body supplies the subagent's operating prompt. Add a body defining what to inspect, severity criteria, and the expected output; otherwise the agent has no security-review-specific instructions.
-
-## Summary
-
-The README and plan updates accurately distinguish completed market-data work from the target architecture, and the root `.claude/settings.json` Stop hook is structurally valid. The independent plugin is currently unloadable, and the custom agents need corrected model/tool metadata before they can be relied on. `git diff --check` also flags the missing final newline in `.claude/settings.json`; that is cosmetic.
+Reviewed the three new untracked planning documents against the current market-data
+implementation, simulator configuration, tests, and the SDK version locked in
+`backend/uv.lock`. No executable files changed, so no test run was required for this
+documentation review.
